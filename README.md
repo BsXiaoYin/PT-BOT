@@ -7,12 +7,6 @@
 - qB 里已有相同种子时不重复添加，直接显示进度
 - 只响应白名单里的 Telegram 用户
 
-## 适用范围
-
-- PT 站：NexusPHP 架构（页面地址是 `torrents.php`、`details.php?id=`）。各站对页面的改动不同，搜索结果解析可能需要调整 `parse_torrents`。
-- qBittorrent：需要开启 WebUI。4.x 和 5.x 都可以用。
-- 系统：Debian 11/12，Python 3.10 及以上。
-
 ## 使用方法
 
 | 命令 | 说明 |
