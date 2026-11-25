@@ -144,10 +144,3 @@ systemctl restart ptbot
 nano /opt/ptbot/.env
 systemctl restart ptbot
 ```
-
-
-## 已知限制
-
-- 只支持一个 NexusPHP 架构的 PT 站。
-- 进度跟踪任务保存在内存里，bot 重启后不会恢复。
-- 进度只显示到下载完成为止，之后的做种情况不再更新。
