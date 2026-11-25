@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram bot：搜索 PT 站（NexusPHP 架构），把选中的种子推送到 qBittorrent 并实时显示下载进度。"""
+"""Telegram bot：在多个 PT 站搜索种子，推送到 qBittorrent 并实时显示下载进度。"""
 import asyncio
 import hashlib
 import html
@@ -29,9 +29,15 @@ TG_TOKEN = os.environ["TG_BOT_TOKEN"]
 ALLOWED_USERS = {int(x) for x in os.environ["TG_ALLOWED_USERS"].split(",") if x.strip()}
 PROXY = os.environ.get("TG_PROXY") or None
 
-PT_BASE = os.environ["PT_BASE_URL"].rstrip("/")
-PT_COOKIE = os.environ["PT_COOKIE"]
+# NexusPHP 站点（不用就留空）
+PT_NAME = os.environ.get("PT_NAME", "PT站")
+PT_BASE = os.environ.get("PT_BASE_URL", "").rstrip("/")
+PT_COOKIE = os.environ.get("PT_COOKIE", "")
 PT_PASSKEY = os.environ.get("PT_PASSKEY", "")
+
+# 馒头（不用就留空）
+MT_TOKEN = os.environ.get("MT_TOKEN", "")
+MT_API_BASE = os.environ.get("MT_API_BASE", "https://api.m-team.cc").rstrip("/")
 
 QB_URL = os.environ["QB_URL"].rstrip("/")
 QB_USER = os.environ["QB_USER"]
@@ -128,7 +134,7 @@ def render_progress(t: dict) -> str:
     return "\n".join(lines)
 
 
-# ---------------- PT 站 ----------------
+# ---------------- PT 站：NexusPHP ----------------
 def parse_torrents(page: str) -> list[dict]:
     """解析 NexusPHP 的 torrents.php 列表页。"""
     soup = BeautifulSoup(page, "html.parser")
@@ -177,11 +183,13 @@ def parse_torrents(page: str) -> list[dict]:
     return results
 
 
-class PTSite:
-    def __init__(self):
+class NexusPHP:
+    def __init__(self, name: str, base: str, cookie: str, passkey: str = ""):
+        self.name = name
+        self.passkey = passkey
         self.http = httpx.AsyncClient(
-            base_url=PT_BASE,
-            headers={"User-Agent": UA, "Cookie": PT_COOKIE},
+            base_url=base,
+            headers={"User-Agent": UA, "Cookie": cookie},
             timeout=20,
             follow_redirects=True,
         )
@@ -196,13 +204,13 @@ class PTSite:
         })
         r.raise_for_status()
         if "login.php" in str(r.url):
-            raise RuntimeError("PT 站 cookie 已失效，请更新 PT_COOKIE")
+            raise RuntimeError(f"{self.name} 的 cookie 已失效，请更新 PT_COOKIE")
         return parse_torrents(r.text)
 
     async def download(self, tid: str) -> bytes:
         params = {"id": tid}
-        if PT_PASSKEY:
-            params["passkey"] = PT_PASSKEY
+        if self.passkey:
+            params["passkey"] = self.passkey
         r = await self.http.get("/download.php", params=params)
         r.raise_for_status()
         # .torrent 是 bencode 格式，以 'd' 开头；返回 HTML 说明没登录或没有权限
@@ -210,6 +218,85 @@ class PTSite:
             raise RuntimeError("下载到的不是种子文件，可能是 cookie 失效或没有下载权限")
         return r.content
 
+
+# ---------------- PT 站：馒头（官方 API） ----------------
+class MTeam:
+    def __init__(self, name: str, token: str, base: str):
+        self.name = name
+        # 不带 User-Agent 会被网关 302 拦截
+        self.http = httpx.AsyncClient(
+            base_url=base,
+            headers={"x-api-key": token, "User-Agent": UA},
+            timeout=20,
+        )
+
+    async def _post(self, path: str, **kwargs):
+        r = await self.http.post(path, **kwargs)
+        if r.is_redirect:
+            raise RuntimeError(f"{self.name} API 返回跳转（{r.status_code}），可能是令牌失效或被风控")
+        r.raise_for_status()
+        j = r.json()
+        if str(j.get("code")) != "0":
+            raise RuntimeError(f"{self.name} API 报错：{j.get('message')}")
+        return j.get("data")
+
+    async def search(self, keyword: str) -> list[dict]:
+        # 接口默认按发布时间排序，这里多取一些，再在本地按做种数排序
+        data = await self._post("/api/torrent/search", json={
+            "mode": "normal",   # normal = 综合区，成人区要用 adult 单独搜
+            "keyword": keyword,
+            "pageNumber": 1,
+            "pageSize": 100,
+        })
+        results = []
+        for t in (data or {}).get("data") or []:
+            status = t.get("status") or {}
+            results.append({
+                "id": str(t["id"]),
+                "title": t.get("name") or "",
+                "desc": t.get("smallDescr") or "",
+                "size": fmt_size(int(t.get("size") or 0)),
+                "seeders": int(status.get("seeders") or 0),
+            })
+        results.sort(key=lambda x: x["seeders"], reverse=True)
+        return results
+
+    async def download(self, tid: str) -> bytes:
+        url = await self._post("/api/torrent/genDlToken", data={"id": tid})
+        if not isinstance(url, str) or not url.startswith("http"):
+            raise RuntimeError("没有拿到种子下载链接")
+        # 用不带令牌的客户端下载，避免把 x-api-key 发给下载链接所在的域名
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                     headers={"User-Agent": UA}) as c:
+            r = await c.get(url)
+        r.raise_for_status()
+        if not r.content.startswith(b"d"):
+            raise RuntimeError("下载到的不是种子文件")
+        return r.content
+
+
+# ---------------- 站点列表：配置了哪个站就启用哪个 ----------------
+SITES: dict = {}
+
+# NexusPHP 站点：PT_ 开头的是第一个站，PT2_ ~ PT9_ 是新增的站，编号可以跳着用
+for n in range(1, 10):
+    prefix = "PT_" if n == 1 else f"PT{n}_"
+    base = os.environ.get(f"{prefix}BASE_URL", "").rstrip("/")
+    cookie = os.environ.get(f"{prefix}COOKIE", "")
+    if base and cookie:
+        key = "np" if n == 1 else f"np{n}"
+        SITES[key] = NexusPHP(
+            os.environ.get(f"{prefix}NAME", f"PT站{n}"),
+            base,
+            cookie,
+            os.environ.get(f"{prefix}PASSKEY", ""),
+        )
+
+if MT_TOKEN:
+    SITES["mt"] = MTeam("馒头", MT_TOKEN, MT_API_BASE)
+
+if not SITES:
+    raise SystemExit("没有配置任何 PT 站：请在 .env 里填写 PT_BASE_URL/PT_COOKIE 或 MT_TOKEN")
 
 # ---------------- qBittorrent ----------------
 class QBittorrent:
@@ -253,7 +340,6 @@ class QBittorrent:
         return items[0] if items else None
 
 
-pt = PTSite()
 qb = QBittorrent()
 
 
@@ -313,7 +399,9 @@ async def watch_progress(bot, chat_id: int, msg_id: int, ih: str, title: str, no
 
 # ---------------- Telegram 处理函数 ----------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("用法：/s 关键词\n结果按做种数从高到低排列，点编号选择种子。")
+    names = "、".join(s.name for s in SITES.values())
+    await update.message.reply_text(
+        f"用法：/s 关键词\n已启用站点：{names}\n结果按做种数从高到低排列，点编号选择种子。")
 
 
 async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -322,25 +410,45 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("用法：/s 关键词")
         return
 
-    msg = await update.message.reply_text(f"正在搜索：{keyword}")
+    if len(SITES) == 1:  # 只有一个站点时跳过选择
+        msg = await update.message.reply_text(f"正在搜索：{keyword}")
+        await run_search(msg, next(iter(SITES)), keyword, ctx)
+        return
+
+    kb = [[InlineKeyboardButton(site.name, callback_data=f"s:{key}")
+           for key, site in SITES.items()]]
+    msg = await update.message.reply_text(f"在哪个站搜索：{keyword}",
+                                          reply_markup=InlineKeyboardMarkup(kb))
+    # 按钮的 callback_data 最多 64 字节，关键词按消息 ID 存起来
+    ctx.user_data.setdefault("keywords", {})[msg.message_id] = keyword
+
+
+async def run_search(msg, key: str, keyword: str, ctx: ContextTypes.DEFAULT_TYPE):
+    site = SITES[key]
+    await msg.edit_text(f"正在 {site.name} 搜索：{keyword}")
     try:
-        results = (await pt.search(keyword))[:MAX_RESULTS]
+        results = (await site.search(keyword))[:MAX_RESULTS]
     except Exception as e:
         log.exception("search failed")
-        await msg.edit_text(f"搜索失败：{e}")
+        await msg.edit_text(f"{site.name} 搜索失败：{e}")
         return
 
     if not results:
-        await msg.edit_text(f"没有找到：{keyword}")
+        await msg.edit_text(f"{site.name} 没有找到：{keyword}")
         return
 
-    ctx.user_data.setdefault("titles", {}).update({r["id"]: r["title"] for r in results})
+    ctx.user_data.setdefault("titles", {}).update(
+        {f"{key}:{r['id']}": r["title"] for r in results})
 
-    lines = [f"<b>{html.escape(keyword)}</b> 的搜索结果（按做种数排序）：\n"]
+    lines = [f"<b>{html.escape(site.name)}</b> · <b>{html.escape(keyword)}</b>"
+             f" 的搜索结果（按做种数排序）：\n"]
     for i, r in enumerate(results, 1):
-        lines.append(f"{i}. {html.escape(r['title'][:80])}\n"
-                     f"     大小 {r['size']} | 做种 {r['seeders']}")
-    buttons = [InlineKeyboardButton(str(i), callback_data=f"t:{r['id']}")
+        line = f"{i}. {html.escape(r['title'][:80])}"
+        if r.get("desc"):
+            line += f"\n     {html.escape(r['desc'][:40])}"
+        line += f"\n     大小 {r['size']} | 做种 {r['seeders']}"
+        lines.append(line)
+    buttons = [InlineKeyboardButton(str(i), callback_data=f"t:{key}:{r['id']}")
                for i, r in enumerate(results, 1)]
     keyboard = [buttons[i:i + 5] for i in range(0, len(buttons), 5)]
 
@@ -360,10 +468,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("已取消")
         return
 
-    if data.startswith("t:"):  # 选中种子 -> 选择下载位置
-        tid = data[2:]
-        title = ctx.user_data.get("titles", {}).get(tid, f"ID {tid}")
-        kb = [[InlineKeyboardButton(f"{name}  ({path})", callback_data=f"p:{tid}:{i}")]
+    if data.startswith("s:"):  # 选中站点 -> 搜索
+        key = data[2:]
+        keyword = ctx.user_data.get("keywords", {}).pop(q.message.message_id, None)
+        if keyword is None or key not in SITES:
+            await q.edit_message_text("搜索已过期，请重新发送 /s 关键词")
+            return
+        await run_search(q.message, key, keyword, ctx)
+        return
+
+    parts = data.split(":")
+
+    if parts[0] == "t" and len(parts) == 3:  # 选中种子 -> 选择下载位置
+        _, key, tid = parts
+        title = ctx.user_data.get("titles", {}).get(f"{key}:{tid}", f"ID {tid}")
+        kb = [[InlineKeyboardButton(f"{name}  ({path})", callback_data=f"p:{key}:{tid}:{i}")]
               for i, (name, path) in enumerate(SAVE_PATHS)]
         kb.append([InlineKeyboardButton("取消", callback_data="cancel")])
         # 发新消息，保留搜索结果列表
@@ -371,17 +490,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                    reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    if data.startswith("p:"):  # 选中路径 -> 下载种子、推送到 qB、开始跟踪进度
-        _, tid, idx = data.split(":")
+    if parts[0] == "p" and len(parts) == 4:  # 选中路径 -> 下载种子、推送到 qB、开始跟踪进度
+        _, key, tid, idx = parts
+        site = SITES.get(key)
+        if site is None:
+            await q.edit_message_text("这个站点已经不在配置里了，请重新搜索")
+            return
         name, path = SAVE_PATHS[int(idx)]
-        title = ctx.user_data.get("titles", {}).get(tid, f"ID {tid}")
+        title = ctx.user_data.get("titles", {}).get(f"{key}:{tid}", f"ID {tid}")
         await q.edit_message_text(f"正在添加：{title}\n位置：{path}")
         try:
-            content = await pt.download(tid)
+            content = await site.download(tid)
             ih = info_hash(content)
             existing = await qb.torrent_info(ih)
             if existing is None:
-                await qb.add_torrent(content, f"{tid}.torrent", path)
+                await qb.add_torrent(content, f"{key}-{tid}.torrent", path)
                 head = f"已添加到 qBittorrent\n{title}\n位置：{name}（{path}）"
             else:
                 head = f"qB 里已有这个种子，不重复添加\n{title}"
@@ -395,6 +518,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.application.create_task(
             watch_progress(ctx.bot, q.message.chat_id, q.message.message_id, ih, title, notify)
         )
+        return
+
+    await q.edit_message_text("按钮已过期，请重新搜索")  # 升级前发出的旧格式按钮
 
 
 def main():
@@ -408,7 +534,7 @@ def main():
     app.add_handler(CommandHandler("s", cmd_search, filters=only_me))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    log.info("bot started")
+    log.info("bot started, sites: %s", ", ".join(s.name for s in SITES.values()))
     app.run_polling(drop_pending_updates=True)
 
 
